@@ -1,0 +1,5 @@
+
+/.venv
+obs_config.json
+yolov5/
+yolov5s.pt
