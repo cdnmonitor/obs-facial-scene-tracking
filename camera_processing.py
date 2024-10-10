@@ -7,15 +7,16 @@ from motion_detection import detect_motion
 from collections import deque
 
 # Buffers to smooth out detections
-detection_buffer = {
-    'desk': {'person': deque(maxlen=3), 'motion': deque(maxlen=10)},
-    'cnc': {'motion': deque(maxlen=10)}
-}
+detection_buffer = {}
 last_scene_change_time = 0
 SCENE_CHANGE_COOLDOWN = 1  # 1 second cooldown
 
 # Queues for each camera
 frame_queues = {}
+
+# Motion detection thresholds
+MOTION_THRESHOLD = 10000  # Adjust this value based on testing
+MIN_CONTOUR_AREA = 100  # Adjust this value based on testing
 
 def capture_frames(camera_name, url, queue):
     cap = cv2.VideoCapture(url)
@@ -32,15 +33,34 @@ def capture_frames(camera_name, url, queue):
             print(f"[WARNING] Failed to capture frame from camera: {camera_name}")
         cv2.waitKey(10)  # Small delay to reduce CPU usage
 
+def apply_detection_boundaries(frame, boundaries):
+    height, width = frame.shape[:2]
+    left = int(boundaries['left'] * width / 100)
+    top = int(boundaries['top'] * height / 100)
+    right = int(boundaries['right'] * width / 100)
+    bottom = int(boundaries['bottom'] * height / 100)
+    return frame[top:bottom, left:right]
+
 async def process_camera_feeds(obs, config):
+    global detection_buffer
+    
     if 'cameras' not in config or not config['cameras']:
         print("No cameras configured. Please run the setup client to add cameras.")
         return
 
-    list_condition_rules(config)
+    # Initialize detection buffers based on the logic conditions
+    for condition_set in config['logic_conditions']:
+        for condition in condition_set['conditions']:
+            camera = condition['camera']
+            detection_type = condition['detection_type']
+            if camera not in detection_buffer:
+                detection_buffer[camera] = {}
+            if detection_type not in detection_buffer[camera]:
+                detection_buffer[camera][detection_type] = deque(maxlen=10)
 
     # Start capture threads
-    for name, url in config['cameras'].items():
+    for name, camera_info in config['cameras'].items():
+        url = camera_info['url'] if isinstance(camera_info, dict) else camera_info
         frame_queues[name] = Queue(maxsize=1)
         threading.Thread(target=capture_frames, args=(name, url, frame_queues[name]), daemon=True).start()
 
@@ -64,7 +84,7 @@ def update_detection_buffer(camera, detection_type, result):
     detection_buffer[camera][detection_type].append(result)
     if detection_type == 'motion':
         # For motion, require more consistent detection
-        return sum(detection_buffer[camera][detection_type]) / len(detection_buffer[camera][detection_type]) > 0.7
+        return sum(detection_buffer[camera][detection_type]) / len(detection_buffer[camera][detection_type]) > 0.5
     else:
         # For person detection, keep it more responsive
         return sum(detection_buffer[camera][detection_type]) / len(detection_buffer[camera][detection_type]) > 0.5
@@ -86,14 +106,24 @@ async def evaluate_conditions(obs, config, frames):
     detection_results = {}
     for camera, frame in frames.items():
         try:
-            person_detected = 'person' in detect_objects(frame, confidence_threshold=0.6)
-            detection_results[f"{camera}_person"] = person_detected
-            print(f"[DEBUG] Person detection for {camera}: {person_detected}")
+            camera_info = config['cameras'][camera]
+            boundaries = camera_info.get('detection_boundaries') if isinstance(camera_info, dict) else None
 
-            motion_threshold = 15000 if camera == 'cnc' else 20000  # Higher threshold for CNC
-            motion_detected = detect_motion(frame, threshold=motion_threshold, min_area=1000)
-            detection_results[f"{camera}_motion"] = motion_detected
-            print(f"[DEBUG] Motion detection for {camera}: {motion_detected}")
+            if boundaries:
+                frame = apply_detection_boundaries(frame, boundaries)
+
+            # Perform detections based on the conditions for this camera
+            for condition_set in config['logic_conditions']:
+                for condition in condition_set['conditions']:
+                    if condition['camera'] == camera:
+                        if condition['detection_type'] == 'person':
+                            person_detected = 'person' in detect_objects(frame, confidence_threshold=0.6)
+                            detection_results[f"{camera}_person"] = update_detection_buffer(camera, 'person', person_detected)
+                            print(f"[DEBUG] Person detection for {camera}: {detection_results[f'{camera}_person']}")
+                        elif condition['detection_type'] == 'motion':
+                            motion_detected, motion_score, contours_count = detect_motion(frame, threshold=MOTION_THRESHOLD, min_area=MIN_CONTOUR_AREA)
+                            detection_results[f"{camera}_motion"] = update_detection_buffer(camera, 'motion', motion_detected)
+                            print(f"[DEBUG] Motion detection for {camera} - Motion detected: {motion_detected}, Score: {motion_score}, Contours: {contours_count}")
         except Exception as e:
             print(f"[ERROR] Error in detection for camera {camera}: {str(e)}")
             detection_results[f"{camera}_person"] = False
@@ -109,57 +139,31 @@ async def evaluate_conditions(obs, config, frames):
             condition_type = condition['condition_type']
 
             if camera not in frames:
-                print(f"[{timestamp:.3f}] [WARNING] Camera '{camera}' not found in frames. Skipping this condition.")
                 all_conditions_met = False
                 break
 
             detection_key = f"{camera}_{detection_type}"
-            if detection_key not in detection_results:
-                print(f"[{timestamp:.3f}] [WARNING] Detection result for '{detection_key}' not found. Skipping this condition.")
-                all_conditions_met = False
-                break
-
-            detection_result = detection_results[detection_key]
-            smoothed_result = update_detection_buffer(camera, detection_type, detection_result)
+            detection_result = detection_results.get(detection_key, False)
 
             condition_met = (
-                (condition_type == 'presence' and smoothed_result) or
-                (condition_type == 'absence' and not smoothed_result)
+                (condition_type == 'presence' and detection_result) or
+                (condition_type == 'absence' and not detection_result)
             )
-
-            presence_absence = "is" if condition_type == 'presence' else "is not"
-            print(f"[{timestamp:.3f}] [DEBUG] Condition: {camera} {presence_absence} detecting {detection_type}")
-            print(f"[{timestamp:.3f}] [DEBUG] Raw Result: {detection_result}, Smoothed Result: {smoothed_result}, Condition Met: {condition_met}")
 
             if not condition_met:
                 all_conditions_met = False
                 break
 
         print(f"[{timestamp:.3f}] [DEBUG] All conditions in set {i} met: {all_conditions_met}")
-        print(f"[{timestamp:.3f}] [DEBUG] Scene to switch to if all conditions are met: {condition_set['scene']}")
-
         if all_conditions_met:
             current_scene = await obs.get_current_scene()
             if current_scene != condition_set['scene']:
                 await obs.switch_scene(condition_set['scene'])
-                print(f"[{timestamp:.3f}] [DEBUG] Switching to scene '{condition_set['scene']}' based on met conditions")
+                print(f"\033[92m[{timestamp:.3f}] [DEBUG] Switching to scene '{condition_set['scene']}' based on met conditions\033[0m")
                 last_scene_change_time = current_time
             else:
                 print(f"[{timestamp:.3f}] [DEBUG] Already in correct scene '{current_scene}' based on met conditions")
-            return  # Exit after first matched condition set
+            return  # Exit after switching scene
 
     current_scene = await obs.get_current_scene()
     print(f"[{timestamp:.3f}] [DEBUG] No condition sets fully met. Current scene: {current_scene}")
-
-
-
-def list_condition_rules(config):
-    print("\nCurrent Condition Rules:")
-    for i, condition_set in enumerate(config['logic_conditions'], 1):
-        print(f"Rule Set {i}:")
-        for j, condition in enumerate(condition_set['conditions'], 1):
-            operator = f" AND " if j > 1 else ""
-            presence_absence = "is" if condition['condition_type'] == 'presence' else "is not"
-            print(f"  {operator}If {condition['camera']} {presence_absence} detecting {condition['detection_type']}")
-        print(f"  Then switch to scene: {condition_set['scene']}")
-    print()

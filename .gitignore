@@ -3,3 +3,7 @@
 obs_config.json
 yolov5/
 yolov5s.pt
+test.py
+__pycache__/camera_processing.cpython-310.pyc
+__pycache__/motion_detection.cpython-310.pyc
+*.pyc

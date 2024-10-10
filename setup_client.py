@@ -1,6 +1,8 @@
 import asyncio
 import json
 from obs_connection import OBSConnection
+import cv2
+import numpy as np
 
 class SetupClient:
     def __init__(self):
@@ -51,13 +53,14 @@ class SetupClient:
             print("1. Add camera")
             print("2. Remove camera")
             print("3. List cameras")
-            print("4. Return to Main Menu")
+            print("4. Add/Update detection boundaries")
+            print("5. Return to Main Menu")
             choice = input("Enter your choice: ")
 
             if choice == '1':
                 name = input("Enter camera name: ")
                 url = input("Enter camera URL: ")
-                self.config['cameras'][name] = url
+                self.config['cameras'][name] = {"url": url}
             elif choice == '2':
                 name = input("Enter camera name to remove: ")
                 if name in self.config['cameras']:
@@ -68,14 +71,117 @@ class SetupClient:
             elif choice == '3':
                 self.list_cameras()
             elif choice == '4':
+                await self.add_detection_boundaries()
+            elif choice == '5':
                 break
             else:
                 print("Invalid choice. Please try again.")
 
     def list_cameras(self):
         print("\nConfigured Cameras:")
-        for name, url in self.config['cameras'].items():
-            print(f"{name}: {url}")
+        for name, camera_info in self.config['cameras'].items():
+            print(f"{name}:")
+            if isinstance(camera_info, dict):
+                print(f"  URL: {camera_info.get('url', 'N/A')}")
+                if 'detection_boundaries' in camera_info:
+                    print(f"  Detection Boundaries: {camera_info['detection_boundaries']}")
+                else:
+                    print("  No detection boundaries set")
+            else:
+                print(f"  URL: {camera_info}")
+                print("  No detection boundaries set")
+
+    async def add_detection_boundaries(self):
+        self.list_cameras()
+        camera_name = input("Enter the name of the camera to add/update detection boundaries: ")
+        if camera_name not in self.config['cameras']:
+            print(f"Camera '{camera_name}' not found.")
+            return
+
+        camera_info = self.config['cameras'][camera_name]
+        if isinstance(camera_info, str):
+            camera_url = camera_info
+        elif isinstance(camera_info, dict):
+            camera_url = camera_info.get('url')
+        else:
+            print(f"Invalid camera information for '{camera_name}'.")
+            return
+
+        # Capture a frame from the camera
+        cap = cv2.VideoCapture(camera_url)
+        ret, frame = cap.read()
+        cap.release()
+
+        if not ret:
+            print(f"Failed to capture frame from camera '{camera_name}'. Please check the URL.")
+            return
+
+        # Create a window to display the frame
+        cv2.namedWindow("Camera Frame", cv2.WINDOW_NORMAL)
+        cv2.imshow("Camera Frame", frame)
+
+        # Get frame dimensions
+        height, width = frame.shape[:2]
+
+        print("Click and drag on the image to set detection boundaries.")
+        print("Press 'C' to confirm the selection, or 'R' to reset.")
+
+        # Initialize variables for mouse callback
+        start_point = None
+        end_point = None
+        drawing = False
+
+        def mouse_callback(event, x, y, flags, param):
+            nonlocal start_point, end_point, drawing
+
+            if event == cv2.EVENT_LBUTTONDOWN:
+                start_point = (x, y)
+                drawing = True
+            elif event == cv2.EVENT_MOUSEMOVE:
+                if drawing:
+                    end_point = (x, y)
+            elif event == cv2.EVENT_LBUTTONUP:
+                end_point = (x, y)
+                drawing = False
+
+        cv2.setMouseCallback("Camera Frame", mouse_callback)
+
+        while True:
+            frame_copy = frame.copy()
+            if start_point and end_point:
+                cv2.rectangle(frame_copy, start_point, end_point, (0, 255, 0), 2)
+
+            cv2.imshow("Camera Frame", frame_copy)
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord('c'):
+                if start_point and end_point:
+                    left = min(start_point[0], end_point[0]) / width * 100
+                    top = min(start_point[1], end_point[1]) / height * 100
+                    right = max(start_point[0], end_point[0]) / width * 100
+                    bottom = max(start_point[1], end_point[1]) / height * 100
+
+                    if isinstance(self.config['cameras'][camera_name], str):
+                        self.config['cameras'][camera_name] = {"url": camera_url}
+
+                    self.config['cameras'][camera_name]['detection_boundaries'] = {
+                        "left": left,
+                        "top": top,
+                        "right": right,
+                        "bottom": bottom
+                    }
+                    print(f"Detection boundaries added/updated for camera '{camera_name}'")
+                    break
+                else:
+                    print("No area selected. Please draw a rectangle on the image.")
+            elif key == ord('r'):
+                start_point = None
+                end_point = None
+            elif key == 27:  # ESC key
+                print("Cancelled boundary selection.")
+                break
+
+        cv2.destroyAllWindows()
 
     async def manage_conditions(self, scenes):
         while True:
@@ -140,6 +246,28 @@ class SetupClient:
                 "condition_type": condition_type,
             }
 
+            # Ask if user wants to use custom detection boundaries for this condition
+            use_custom_boundaries = input("Use custom detection boundaries for this condition? (y/n): ").lower() == 'y'
+            if use_custom_boundaries:
+                print("Enter custom detection boundaries (as percentage of frame):")
+                try:
+                    left = float(input("Left boundary (0-100): "))
+                    top = float(input("Top boundary (0-100): "))
+                    right = float(input("Right boundary (0-100): "))
+                    bottom = float(input("Bottom boundary (0-100): "))
+
+                    if not (0 <= left < right <= 100 and 0 <= top < bottom <= 100):
+                        raise ValueError("Invalid boundary values")
+
+                    new_condition['custom_boundaries'] = {
+                        "left": left,
+                        "top": top,
+                        "right": right,
+                        "bottom": bottom
+                    }
+                except ValueError:
+                    print("Invalid input. Using default camera boundaries.")
+
             if conditions:
                 print("\nOperator for this condition:")
                 print("1. AND")
@@ -170,6 +298,7 @@ class SetupClient:
             "scene": scene
         })
         print("Condition set added successfully.")
+
 
     def list_conditions(self):
         print("\nConfigured Condition Sets:")
