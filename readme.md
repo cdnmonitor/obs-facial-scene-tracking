@@ -85,7 +85,7 @@ The `obs_config.json` file contains the necessary settings for the application. 
 
 ## Camera Compatibility
 
-This system is compatible with any camera that can provide an MJPEG stream. This includes:
+This system is compatible with any camera that can provide a MJPEG stream. This includes:
 - USB webcams
 - IP cameras
 - Smartphones running IP camera apps
